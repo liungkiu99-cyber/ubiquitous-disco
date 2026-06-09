@@ -3552,12 +3552,15 @@ task.spawn(function()
             if avail == false then
                 if not _cooldownNotified[shrineName] then
                     _cooldownNotified[shrineName] = true
+                    local cdSecs = parseCooldownSecs(getShrineStatusText(shrineName)) or 1800
+                    _shrineCooldownUntil[shrineName] = tick() + cdSecs  -- persist so orchestrator can mark done even if tablet unloads
                     HSHub:Notify(('%s shrine selesai — cooldown (%s)')
                         :format(shrineName, getShrineStatusText(shrineName) or '...'), 'ok', 3)
                 end
                 return
             end
             _cooldownNotified[shrineName] = nil    -- available again -> resume
+            _shrineCooldownUntil[shrineName] = nil -- clear deadline so orchestrator doesn't ghost-complete a fresh shrine
 
             -- V18 (ANTI-BAN, modeled on LUNAR's working pattern): after each TP, WAIT
             -- ~0.8s so the position SETTLES before firing a remote, then snap BACK to
@@ -3694,6 +3697,11 @@ task.spawn(function()
                         -- loop will pick it up once _scanningRegions = false; if not,
                         -- flag for hop on the next farm tick.
                         if not foundMeat then _noMeatHopReady = true end
+                        _noMeatSince     = 0   -- FIX: reset grace timer so the sweep doesn't
+                                               -- immediately re-trigger on the very next tick.
+                                               -- Without this, tick()-_noMeatSince is already
+                                               -- >3 s the moment _scanningRegions flips false,
+                                               -- causing Ardor<->Angelic oscillation forever.
                         _scanningRegions = false
                     end)
                 end
@@ -4449,8 +4457,8 @@ do
                         for _, n in ipairs(order) do
                             if not completed[n] then
                                 local av = shrineAvailable(n)
-                                if av == false then
-                                    completed[n] = true                 -- on cooldown = done this server
+                                if av == false or (_shrineCooldownUntil[n] and tick() < _shrineCooldownUntil[n]) then
+                                    completed[n] = true                 -- on cooldown = done this server (live tablet OR persisted deadline)
                                 elseif shrineReachable(n) then
                                     active = n; break                   -- loaded / position known -> farm it
                                 else
@@ -4470,18 +4478,8 @@ do
                             end
                         else
                             statusSet(('farming %s (%d/%d done)'):format(active, doneN, target))
-                            -- No-progress guard: if the active shrine has made zero food-hold
-                            -- progress for 5 minutes, force a server hop. This fires when the
-                            -- no-carcass hop (90 s) didn't fire (e.g. toggle was off at the
-                            -- time) or the farm is stuck for any other reason.
-                            if S.AutoFarmHopWhenDone and _lastProgressTick > 0
-                                    and (tick() - _lastProgressTick > 300)
-                                    and (tick() - lastHop > 30) then
-                                lastHop = tick()
-                                statusSet('no progress 5 min -> server hop')
-                                task.wait(1.5)
-                                serverHop()
-                            end
+                            -- No-progress hop is handled by the no-carcass region sweep in the
+                            -- farm loop (scans all TABLET_POS coords, hops only if truly empty).
                         end
                     end
                 end)
