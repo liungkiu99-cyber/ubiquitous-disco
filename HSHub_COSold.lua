@@ -3110,7 +3110,15 @@ task.spawn(function()
                 local char = getChar()
                 if char and hudStatText('Hunger') ~= '100%' then
                     local diet = creatureDiet()
-                    local food = findNearestFood(function(m) return foodAllowedFor(diet, m:GetAttribute('FoodDataName')) end)
+                    local food = findNearestFood(function(m)
+                        local fdn = m:GetAttribute('FoodDataName')
+                        if not foodAllowedFor(diet, fdn) then return false end
+                        -- skip depleted meat (value < 50) — avoids TP-to-empty-carcass stuck loop
+                        if foodCategory(fdn) == 'meat' then
+                            if (tonumber(m:GetAttribute('Value')) or 0) < 50 then return false end
+                        end
+                        return true
+                    end)
                     if food then
                         local foodPart = food:IsA('Model') and (food.PrimaryPart or food:FindFirstChild('Food') or food:FindFirstChildWhichIsA('BasePart')) or food
                         if foodPart and foodPart:IsA('BasePart') then
@@ -3568,7 +3576,7 @@ task.spawn(function()
                             local val    = tonumber(m:GetAttribute('Value')) or 0
                             local t      = tonumber(m:GetAttribute('T'))
                             local locked = (t ~= nil and myTier > 0 and myTier < t) or false
-                            if not (locked and val <= 15) then        -- tier-locked + low = skip
+                            if val >= 50 and not (locked and val <= 15) then  -- skip empty/low meat (<50); tier-locked+low = skip
                                 local part = m:IsA('BasePart') and m
                                     or (m:IsA('Model') and (m.PrimaryPart or m:FindFirstChildWhichIsA('BasePart')))
                                 if part and val > bestVal then
