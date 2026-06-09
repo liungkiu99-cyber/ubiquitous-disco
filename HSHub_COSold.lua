@@ -3467,7 +3467,12 @@ end
 -- AND per-shrine ArtifactFarm toggles
 -- ════════════════════════════════════════════════════════════════════
 local _cooldownNotified = {}   -- notify "cooldown" once per available->cooldown edge
-local _meatBlacklist    = {}   -- meat models that failed BOTH full + piece pickup
+local _meatBlacklist      = {}   -- meat models that failed BOTH full + piece pickup
+local _lastBlacklistClear = 0    -- tick() when _meatBlacklist was last wiped (auto-flush every 3 min)
+local _noMeatSince        = 0    -- tick() when farm first noticed 0 valid carcass (grace-period timer)
+local _lastProgressTick   = 0    -- tick() of last successful food-hold cycle; 0 = none yet this session
+local _scanningRegions    = false -- true while the region-sweep task is running (gates farm loop)
+local _noMeatHopReady     = false -- set by sweep task when ALL regions found empty -> hop next tick
 local _shrineCooldownUntil = {} -- per-shrine: tick() until which we go FULLY SILENT (done)
 -- parse the tablet's TimerGui countdown ("29m 58s") into seconds
 local function parseCooldownSecs(txt)
@@ -3515,7 +3520,7 @@ task.spawn(function()
         local trOn  = S.AutoTraits
         local shrineName = getActiveShrine()
 
-        if shrineName then pcall(function()
+        if shrineName and not _scanningRegions then pcall(function()
             -- ARTIFACT FARM V14 (rebuilt fully from ArtifactScan data 2026-05-29):
             --   Status : tablet.TimerGui.TimerLabel.Text — "AVAILABLE NOW" = offerable,
             --            else (e.g. "29m 58s") = on cooldown -> idle (auto-resumes).
@@ -3558,7 +3563,11 @@ task.spawn(function()
             -- ~0.8s so the position SETTLES before firing a remote, then snap BACK to
             -- "home". Rapid TP-spam + staying far away was the ban signature (LUNAR's
             -- own AutoGachaTokens does save->TP->wait(1)->act->TP-back). Slower = safer.
-            local home = root.CFrame   -- current spot (near shrine region); we return here
+            -- FIX: use a TABLET-RELATIVE anchor (28 studs in front, 8 up) instead of
+            -- root.CFrame so the player NEVER snaps back into shrine geometry. If the
+            -- tablet CFrame is unavailable for any reason we fall back to root.CFrame.
+            local homeOk, homeVal = pcall(function() return tablet.CFrame * CFrame.new(0, 8, 28) end)
+            local home = homeOk and homeVal or root.CFrame
             local held = tonumber(char:GetAttribute('HeldCount')) or 0
             if held < 1 then
                 local foodFolder = (interactions() or {}):FindFirstChild('Food')
@@ -3567,6 +3576,13 @@ task.spawn(function()
                     local d = char:FindFirstChild('Data')
                     myTier = (d and tonumber(d:GetAttribute('Tier'))) or 0
                 end)
+                -- Auto-flush stale blacklist every 3 min. Without this, once every
+                -- carcass in a bad cycle is blacklisted the farm stalls PERMANENTLY
+                -- until rejoin. The flush lets previously-failed carcasses retry.
+                if tick() - _lastBlacklistClear > 180 then
+                    _meatBlacklist = {}
+                    _lastBlacklistClear = tick()
+                end
                 local bestM, bestPart, bestVal, bestLocked = nil, nil, -1, false
                 if foodFolder then
                     for _, m in ipairs(foodFolder:GetChildren()) do
@@ -3607,12 +3623,109 @@ task.spawn(function()
             end
             -- carrying now -> TP to shrine, WAIT to settle, offer, then snap BACK home.
             if held >= 1 then
+                _lastProgressTick = tick()   -- record real progress for no-progress hop guard
                 pcall(function() root.CFrame = tablet.CFrame + Vector3.new(0, 6, 0) end)
                 task.wait(0.5)                     -- settle at the shrine before offering (user-tuned 0.9->0.5)
                 local wo = getRemote('WardenOffering')
                 if wo then pcall(function() wo:InvokeServer(offerNameOf(shrineName)) end) end
                 task.wait(0.4)
                 pcall(function() root.CFrame = home end)   -- LUNAR-style snap back
+            end
+
+            -- ── NO-CARCASS REGION SWEEP ─────────────────────────────────────────
+            -- Instead of blindly waiting and hopping on a timer, we sweep EVERY
+            -- known shrine region (TABLET_POS) before giving up on a server.
+            -- Flow: held<1 for >3 s → spawn one-shot sweep task → TP to each region,
+            -- wait 5 s to stream local food objects, check for valid carcass.
+            -- • Any region has meat → reset, normal farming resumes automatically.
+            -- • All regions empty   → _noMeatHopReady = true → hop on next tick.
+            -- The farm loop is gated (_scanningRegions=true) during the sweep so
+            -- neither loop conflicts on root.CFrame.
+            if held < 1 then
+                if _noMeatSince == 0 then _noMeatSince = tick() end
+                -- Start sweep after a 3 s grace period (avoids scan-spam on a
+                -- transient one-tick miss) and only under Autonomous mode.
+                if not _scanningRegions and not _noMeatHopReady
+                        and (tick() - _noMeatSince > 3)
+                        and (S.AutoNormalMode or S.AutoStealthMode) then
+                    _scanningRegions = true
+                    task.spawn(function()
+                        local root2 = getRoot()
+                        if not root2 then _scanningRegions = false; return end
+                        -- Flatten TABLET_POS into a deduplicated position list.
+                        -- Multi-altar entries (tables) use only the first altar since
+                        -- food streaming radius covers the full shrine cluster.
+                        local positions, seen = {}, {}
+                        for _, v in pairs(TABLET_POS) do
+                            local pos
+                            if typeof(v) == 'Vector3' then
+                                pos = v
+                            elseif type(v) == 'table' and v[1] then
+                                pos = v[1]
+                            end
+                            if pos then
+                                -- Deduplicate on a ~60-stud grid (shrines never that close)
+                                local key = math.floor(pos.X/60)..','..math.floor(pos.Z/60)
+                                if not seen[key] then
+                                    seen[key] = true
+                                    positions[#positions + 1] = pos
+                                end
+                            end
+                        end
+                        local foundMeat = false
+                        for _, pos in ipairs(positions) do
+                            if foundMeat then break end
+                            pcall(function()
+                                root2.CFrame = CFrame.new(pos + Vector3.new(0, 15, 0))
+                            end)
+                            task.wait(5)   -- wait for streaming to load nearby food objects
+                            local f = (interactions() or {}):FindFirstChild('Food')
+                            if f then
+                                for _, m in ipairs(f:GetChildren()) do
+                                    if isOfferMeat(m:GetAttribute('FoodDataName'))
+                                            and not m:GetAttribute('Held') then
+                                        local val = tonumber(m:GetAttribute('Value')) or 0
+                                        if val >= 50 then foundMeat = true; break end
+                                    end
+                                end
+                            end
+                        end
+                        -- Signal result: if meat was found somewhere the normal farm
+                        -- loop will pick it up once _scanningRegions = false; if not,
+                        -- flag for hop on the next farm tick.
+                        if not foundMeat then _noMeatHopReady = true end
+                        _scanningRegions = false
+                    end)
+                end
+                -- Sweep finished and confirmed empty → hop to a fresh server.
+                if _noMeatHopReady and S.AutoFarmHopWhenDone
+                        and (S.AutoNormalMode or S.AutoStealthMode) then
+                    _noMeatHopReady     = false
+                    _noMeatSince        = 0
+                    _meatBlacklist      = {}
+                    _lastBlacklistClear = tick()
+                    pcall(function()
+                        local ok2, raw = pcall(function()
+                            return game:HttpGet('https://games.roblox.com/v1/games/'
+                                .. tostring(game.PlaceId)
+                                .. '/servers/Public?sortOrder=Asc&limit=100')
+                        end)
+                        if ok2 and raw then
+                            local d2 = HttpService:JSONDecode(raw)
+                            if d2 and d2.data then
+                                for _, srv in ipairs(d2.data) do
+                                    if srv.playing < srv.maxPlayers and srv.id ~= game.JobId then
+                                        TeleportService:TeleportToPlaceInstance(game.PlaceId, srv.id, LP)
+                                        return
+                                    end
+                                end
+                            end
+                        end
+                    end)
+                end
+            else
+                _noMeatSince    = 0
+                _noMeatHopReady = false   -- food found -> cancel any pending scan result
             end
         end) end
 
@@ -4000,6 +4113,48 @@ task.spawn(function()
 end)
 
 -- ════════════════════════════════════════════════════════════════════
+-- AUTONOMOUS FARM CONFIG PERSISTENCE
+-- Saves the three on/off toggles to disk so autoexecute + server-hop
+-- restores them automatically on every new session.
+-- File: ._hsmeta/auto_farm.cfg  (reuses the existing telemetry folder)
+-- ════════════════════════════════════════════════════════════════════
+local AUTO_CFG_FOLDER = "._hsmeta"
+local AUTO_CFG_FILE   = AUTO_CFG_FOLDER .. "/auto_farm.cfg"
+
+local _wf  = writefile  or Stealth.writefile  or function() end
+local _rf  = readfile   or Stealth.readfile   or function() return nil end
+local _ifl = isfile     or Stealth.isfile     or function() return false end
+local _iff = isfolder   or Stealth.isfolder   or function() return false end
+local _mkf = makefolder or Stealth.makefolder or function() end
+
+local function saveAutoFarmConfig()
+    pcall(function()
+        if not _iff(AUTO_CFG_FOLDER) then _mkf(AUTO_CFG_FOLDER) end
+        _wf(AUTO_CFG_FILE, HttpService:JSONEncode({
+            n = S.AutoNormalMode      and 1 or 0,
+            s = S.AutoStealthMode     and 1 or 0,
+            h = S.AutoFarmHopWhenDone and 1 or 0,
+        }))
+    end)
+end
+
+local function loadAutoFarmConfig()
+    local cfg = { normal = false, stealth = false, hop = false }
+    pcall(function()
+        if not _ifl(AUTO_CFG_FILE) then return end
+        local raw = _rf(AUTO_CFG_FILE)
+        if not raw then return end
+        local ok, d = pcall(HttpService.JSONDecode, HttpService, raw)
+        if ok and d then
+            cfg.normal  = (d.n == 1)
+            cfg.stealth = (d.s == 1)
+            cfg.hop     = (d.h == 1)
+        end
+    end)
+    return cfg
+end
+
+-- ════════════════════════════════════════════════════════════════════
 -- AUTONOMOUS FARM (2026-06-06) — device-agnostic spawn + priority farm + hop
 --   Normal  : spawn any ALIVE slot (restart if all dead) -> farm priority shrines.
 --   Stealth : only spawn an INVISIBLE-ability creature -> auto-activate invis -> farm.
@@ -4009,9 +4164,10 @@ end)
 --   Spawn/restart logic ported from the proven HSHub_SpawnBot.lua (confirmed in-game).
 -- ════════════════════════════════════════════════════════════════════
 do
-    S.AutoNormalMode      = false
-    S.AutoStealthMode     = false
-    S.AutoFarmHopWhenDone = false
+    local _savedCfg       = loadAutoFarmConfig()   -- restore from disk (survive hop / autoexecute)
+    S.AutoNormalMode      = _savedCfg.normal
+    S.AutoStealthMode     = _savedCfg.stealth
+    S.AutoFarmHopWhenDone = _savedCfg.hop
 
     local UIS        = game:GetService('UserInputService')
     local GuiService = game:GetService('GuiService')
@@ -4228,6 +4384,7 @@ do
 
     -- ═══ conditional server hop (only when shrines done) ═══
     local function serverHop()
+        saveAutoFarmConfig()                    -- persist mode before leaving server
         statusSet('server hop (shrines done)')
         pcall(function()
             local ok, raw = pcall(function()
@@ -4313,6 +4470,18 @@ do
                             end
                         else
                             statusSet(('farming %s (%d/%d done)'):format(active, doneN, target))
+                            -- No-progress guard: if the active shrine has made zero food-hold
+                            -- progress for 5 minutes, force a server hop. This fires when the
+                            -- no-carcass hop (90 s) didn't fire (e.g. toggle was off at the
+                            -- time) or the farm is stuck for any other reason.
+                            if S.AutoFarmHopWhenDone and _lastProgressTick > 0
+                                    and (tick() - _lastProgressTick > 300)
+                                    and (tick() - lastHop > 30) then
+                                lastHop = tick()
+                                statusSet('no progress 5 min -> server hop')
+                                task.wait(1.5)
+                                serverHop()
+                            end
                         end
                     end
                 end)
@@ -4343,15 +4512,15 @@ do
         end
         statusSet(('calibrate failed - default OFFSET=(%d,%d)'):format(math.floor(OFFSET.X), math.floor(OFFSET.Y)))
     end)
-    Sec:AddToggle({ Name = 'Normal Mode (any creature)', Key = 'AutoNormalMode', Default = false,
+    Sec:AddToggle({ Name = 'Normal Mode (any creature)', Key = 'AutoNormalMode', Default = _savedCfg.normal,
         Tip = 'Spawn any ALIVE slot (restart if all dead), then farm priority shrines',
-        Callback = function(v) S.AutoNormalMode = v; if v then S.AutoStealthMode = false end end })
-    Sec:AddToggle({ Name = 'Stealth Mode (invisible creature)', Key = 'AutoStealthMode', Default = false,
+        Callback = function(v) S.AutoNormalMode = v; if v then S.AutoStealthMode = false end; saveAutoFarmConfig() end })
+    Sec:AddToggle({ Name = 'Stealth Mode (invisible creature)', Key = 'AutoStealthMode', Default = _savedCfg.stealth,
         Tip = 'Only spawn a creature with invisibility; auto-activates invis in game',
-        Callback = function(v) S.AutoStealthMode = v; if v then S.AutoNormalMode = false end end })
-    Sec:AddToggle({ Name = 'Server Hop when shrines done', Key = 'AutoFarmHopWhenDone', Default = false,
+        Callback = function(v) S.AutoStealthMode = v; if v then S.AutoNormalMode = false end; saveAutoFarmConfig() end })
+    Sec:AddToggle({ Name = 'Server Hop when shrines done', Key = 'AutoFarmHopWhenDone', Default = _savedCfg.hop,
         Tip = 'After 5/all shrines are deposited (cooldown), hop to a fresh server',
-        Callback = function(v) S.AutoFarmHopWhenDone = v end })
+        Callback = function(v) S.AutoFarmHopWhenDone = v; saveAutoFarmConfig() end })
     Sec:AddLabel('Priority: Ardor > Novus > Eigion > rest. Invisible list: 33 creatures.', Color3.fromRGB(150, 150, 180))
 end
 
