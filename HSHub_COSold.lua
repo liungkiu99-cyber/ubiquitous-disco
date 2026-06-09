@@ -3592,7 +3592,7 @@ task.spawn(function()
                             local val    = tonumber(m:GetAttribute('Value')) or 0
                             local t      = tonumber(m:GetAttribute('T'))
                             local locked = (t ~= nil and myTier > 0 and myTier < t) or false
-                            if val >= 50 and not (locked and val <= 15) then  -- skip empty/low meat (<50); tier-locked+low = skip
+                            if val >= 100 and not (locked and val <= 15) then  -- skip low meat (<100); tier-locked+low = skip
                                 local part = m:IsA('BasePart') and m
                                     or (m:IsA('Model') and (m.PrimaryPart or m:FindFirstChildWhichIsA('BasePart')))
                                 if part and val > bestVal then
@@ -3685,7 +3685,7 @@ task.spawn(function()
                                     if isOfferMeat(m:GetAttribute('FoodDataName'))
                                             and not m:GetAttribute('Held') then
                                         local val = tonumber(m:GetAttribute('Value')) or 0
-                                        if val >= 50 then foundMeat = true; break end
+                                        if val >= 100 then foundMeat = true; break end
                                     end
                                 end
                             end
