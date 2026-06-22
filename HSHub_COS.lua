@@ -7,7 +7,7 @@
 
     Game     : Creatures of Sonaria  (Roblox creature survival)
     Build    : HS-COS-V4
-    Bundled  : 2026-06-16
+    Bundled  : 2026-06-18
     Library  : HSHub_UI v1.0.0
 
     This is a BUNDLED file. Do not edit directly — instead edit
@@ -2968,7 +2968,6 @@ for _, n in ipairs(SHRINES_LOW)  do S.ArtifactToggles[n] = false end
 for _, n in ipairs(SHRINES_HIGH) do S.ArtifactToggles[n] = false end
 S.AutoServerHopArtifact = false
 S.MeatMinValue = 100   -- artifact farm: ignore carcasses below this Value (user: minimum 100)
-S.MeatRegionMemory = false  -- if a shrine region has no meat, fetch from a remembered meat-rich region
 -- live status-label handles (updated by the status loop from the tablet's TimerGui)
 local shrineStatusLabels = {}
 local meatCounterLabel   = nil   -- updated by the status loop with server-wide carcass stats
@@ -3048,9 +3047,6 @@ do
     Rec:AddToggle({ Name='Auto Server Hop', Key='ASH_Art', Default=false,
         Tip="If the server's food runs out, hop to another",
         Callback=function(v) S.AutoServerHopArtifact = v end })
-    Rec:AddToggle({ Name='Remember Meat Regions', Key='MRM', Default=false,
-        Tip='MANUAL farm: rotate regions to find meat >=100 (notebook). Autonomous farm always does this.',
-        Callback=function(v) S.MeatRegionMemory = v end })
 end
 
 -- ─── Tab 5: TELEPORTS ───────────────────────────────────────────────
@@ -3576,9 +3572,9 @@ local function liveMeatHere()
     end
     return false
 end
--- region rotation is active when the user enabled it (manual "Remember Meat") OR whenever the
--- autonomous farm is running (autonomous NEEDS to roam regions to find meat).
-local function notebookOn() return S.MeatRegionMemory or S.AutoNormalMode or S.AutoStealthMode end
+-- region rotation (notebook) runs AUTOMATICALLY whenever the autonomous farm is on (it needs to
+-- roam regions to find meat). The manual Artifacts farm is untouched (farms the shrine's own region).
+local function notebookOn() return S.AutoNormalMode or S.AutoStealthMode end
 -- every region scanned this server and found empty? (= meat truly gone -> time to hop + reset)
 local function allRegionsBlacklisted()
     for _, rg in ipairs(REGION_COORDS) do
@@ -3616,6 +3612,7 @@ local function huntStep(root)
         end
         local nm = REGION_COORDS[huntIdx][1]
         regionBlacklist[nm] = true; regionLog[nm] = 0   -- confirmed empty -> remember as empty this server
+        if S._autoLog then S._autoLog('region ' .. nm .. ' empty -> next') end
     end
     local nextIdx
     for step = 1, #REGION_COORDS do
@@ -3736,7 +3733,7 @@ task.spawn(function()
                             local val    = tonumber(m:GetAttribute('Value')) or 0
                             local t      = tonumber(m:GetAttribute('T'))
                             local locked = (t ~= nil and myTier > 0 and myTier < t) or false
-                            if val >= (S.MeatMinValue or 100) and not (locked and val <= 15) then  -- min-value floor + tier-lock skip
+                            if val >= (S.MeatMinValue or 100) and not locked then  -- ONLY full carcasses >=100 we can carry whole (never <100 pieces)
                                 local part = m:IsA('BasePart') and m
                                     or (m:IsA('Model') and (m.PrimaryPart or m:FindFirstChildWhichIsA('BasePart')))
                                 if part and val > bestVal then
@@ -3754,18 +3751,11 @@ task.spawn(function()
                     home = bestPart.CFrame + Vector3.new(0, 4, 0)   -- after offering, come BACK to this food spot -> only 2 places: FOOD <-> SHRINE
                     pcall(function() root.CFrame = home end)
                     task.wait(0.5)                 -- settle before firing (anti-detect)
-                    if not bestLocked then
-                        local full = getRemote('FoodPickup')
-                        if full then pcall(function() full:InvokeServer(bestM) end) end
-                        task.wait(0.6)
-                    end
+                    local full = getRemote('FoodPickup')   -- FULL carcass only (no FoodChunk -> never a <100 piece)
+                    if full then pcall(function() full:InvokeServer(bestM) end) end
+                    task.wait(0.6)
                     if (tonumber(char:GetAttribute('HeldCount')) or 0) < 1 then
-                        local piece = getRemote('FoodChunk')
-                        if piece then pcall(function() piece:InvokeServer(bestM) end) end
-                        task.wait(0.6)
-                    end
-                    if (tonumber(char:GetAttribute('HeldCount')) or 0) < 1 then
-                        _meatBlacklist[bestM] = true   -- can't take this one; try next-highest next cycle
+                        _meatBlacklist[bestM] = true   -- couldn't carry the full carcass -> skip it
                     end
                 elseif notebookOn() then
                     huntStep(root)                     -- notebook: rescan-confirm empty, then blacklist + rotate to next
@@ -3794,6 +3784,7 @@ task.spawn(function()
                         if tablet then break end
                     end
                 end
+                if not tablet and S._autoLog then S._autoLog('no tablet @ ' .. shrineName .. ' - cant offer (stuck?)') end
                 if tablet then
                     if shrineAvailable(shrineName) == false then
                         -- went on cooldown while carrying -> notify once, KEEP the meat; getActiveShrine /
@@ -3806,6 +3797,7 @@ task.spawn(function()
                     else
                         _cooldownNotified[shrineName] = nil
                         S._farmProgressAt = tick()     -- progress signal for the autonomous anti-stuck watchdog
+                        if S._autoLog then S._autoLog('tp shrine + offer @ ' .. shrineName) end
                         pcall(function() root.CFrame = tablet.CFrame + Vector3.new(0, 6, 0) end)
                         task.wait(0.5)                 -- settle at the shrine before offering
                         local wo = getRemote('WardenOffering')
@@ -4280,6 +4272,26 @@ do
     end
 
     local statusSet = function() end   -- replaced by the UI label setter below
+
+    -- ═══ LIVE STATUS LOG ═══ lightweight ring buffer (just strings) — powers the multi-line status
+    -- panel + the on-demand log export. NO continuous heavy capture, so no lag; it only records the
+    -- status transitions that already happen + a few farm-loop details while autonomous is running.
+    local statusLog   = {}             -- { {t, msg} } recent statuses (cap STATUS_MAX)
+    local STATUS_MAX  = 150
+    local statusLines = {}             -- visible label handles (filled at tab build)
+    local function pushStatus(msg)
+        msg = tostring(msg)
+        statusLog[#statusLog + 1] = { t = tick(), msg = msg }
+        if #statusLog > STATUS_MAX then table.remove(statusLog, 1) end
+        local n = #statusLines
+        for i = 1, n do
+            local e = statusLog[#statusLog - n + i]   -- last n entries, newest at the bottom line
+            local lbl = statusLines[i]
+            if lbl then pcall(function() lbl:Set(e and e.msg or '') end) end
+        end
+    end
+    -- detail logger callable from the module-level farm loop (records ONLY while autonomous runs)
+    S._autoLog = function(msg) if S.AutoNormalMode or S.AutoStealthMode then pushStatus(msg) end end
     local function panelHide() pcall(function() HSHub.ScreenGui.Enabled = false end) end
     local function panelShow() pcall(function() HSHub.ScreenGui.Enabled = true  end) end
 
@@ -4607,20 +4619,19 @@ do
     end)
 
     -- ═══ UI TAB ═══
-    local Tab = Window:CreateTab('Autonomous', '🤖')
+    local Tab = Window:CreateTab('Autonomous', '>')
     local Sec = Tab:CreateSection('AUTONOMOUS FARM')
-    Sec:AddLabel('Auto-calibrates on load. Just pick ONE mode. Runs from lobby OR in-game.', Color3.fromRGB(180, 220, 255))
-    local statusLbl = Sec:AddLabel('Status: starting...', Color3.fromRGB(150, 205, 150))
-    statusSet = function(t) pcall(function() statusLbl:Set('Status: ' .. tostring(t)) end) end
+    Sec:AddLabel('Auto-calibrates on load. Pick ONE mode. Runs from lobby or in-game.', Color3.fromRGB(170, 200, 235))
+    statusSet = pushStatus
     -- auto-calibrate on load (no button): measure the tap OFFSET, retry, else keep default
     task.spawn(function()
         task.wait(3)
         for _ = 1, 4 do
             panelHide(); local ok, off = autoCalibrate(); panelShow()
-            if ok then statusSet(('auto-calibrated OFFSET=(%d,%d)'):format(math.floor(off.X), math.floor(off.Y))); return end
-            statusSet('auto-calibrate retry...'); task.wait(4)
+            if ok then statusSet(('calibrated offset (%d,%d)'):format(math.floor(off.X), math.floor(off.Y))); return end
+            statusSet('calibrate retry...'); task.wait(4)
         end
-        statusSet(('calibrate failed - default OFFSET=(%d,%d)'):format(math.floor(OFFSET.X), math.floor(OFFSET.Y)))
+        statusSet(('calibrate failed - default offset (%d,%d)'):format(math.floor(OFFSET.X), math.floor(OFFSET.Y)))
     end)
     Sec:AddToggle({ Name = 'Auto Farm: Normal', Key = 'AutoNormalMode', Default = false,
         Tip = 'Spawn any alive creature, then auto-farm shrines.',
@@ -4641,7 +4652,76 @@ do
     Sec:AddTextbox({ Name = 'Hardcore realm Y', Default = '360', Callback = function(v) S.RealmHardcoreY = tonumber(v) or 0 end })
     Sec:AddTextbox({ Name = 'Normal realm X', Default = '570', Callback = function(v) S.RealmNormalX = tonumber(v) or 0 end })
     Sec:AddTextbox({ Name = 'Normal realm Y', Default = '200', Callback = function(v) S.RealmNormalY = tonumber(v) or 0 end })
-    Sec:AddLabel('Farms Ardor > Eigion > Novus (hardcore: Shadow). Meat auto-rotates regions. Invis list: 33.', Color3.fromRGB(150, 150, 180))
+
+    -- ── LIVE STATUS (last 4 actions, newest at the bottom) ──
+    local LV = Tab:CreateSection('LIVE STATUS')
+    for i = 1, 4 do statusLines[i] = LV:AddLabel('', Color3.fromRGB(150, 205, 150)) end
+    pushStatus('idle')
+
+    -- ── REGION STATS ──
+    local RG = Tab:CreateSection('REGION STATS')
+    local nowLbl   = RG:AddLabel('Now: idle',    Color3.fromRGB(180, 220, 255))
+    local meatLbl  = RG:AddLabel('Meat: -',      Color3.fromRGB(170, 230, 180))
+    local emptyLbl = RG:AddLabel('Empty: 0/15',  Color3.fromRGB(230, 190, 150))
+    local cdLbl    = RG:AddLabel('Cooldowns: -', Color3.fromRGB(220, 200, 150))
+    local function exportLog()
+        local out = {}
+        out[#out+1] = '=== HS HUB CoS · Autonomous Log ==='
+        out[#out+1] = 'time : ' .. os.date('%Y-%m-%d %H:%M:%S')
+        out[#out+1] = ('place=%s  job=%s'):format(tostring(game.PlaceId), tostring(game.JobId))
+        out[#out+1] = ('mode : normal=%s stealth=%s serverhop=%s realmhop=%s')
+            :format(tostring(S.AutoNormalMode), tostring(S.AutoStealthMode), tostring(S.AutoServerHopArtifact),
+                    tostring(S.RealmHopArtifact))
+        out[#out+1] = ('now  : farming=%s  hunt-region=%s')
+            :format(tostring(lastActive), tostring(huntIdx > 0 and REGION_COORDS[huntIdx] and REGION_COORDS[huntIdx][1] or '-'))
+        out[#out+1] = '--- regions ---'
+        for _, rg in ipairs(REGION_COORDS) do
+            local nm = rg[1]
+            local stt = regionBlacklist[nm] and 'EMPTY' or (((regionLog[nm] or 0) > 0) and ('meat ' .. tostring(regionLog[nm])) or 'unscanned')
+            out[#out+1] = ('  %-18s %s'):format(nm, stt)
+        end
+        out[#out+1] = '--- shrine cooldowns ---'
+        for n, e in pairs(completed) do
+            out[#out+1] = ('  %-12s %s'):format(n, (e and tick() < e) and (math.ceil((e - tick()) / 60) .. 'm left') or 'ready')
+        end
+        out[#out+1] = ('--- status log (last %d) ---'):format(#statusLog)
+        local t0 = statusLog[1] and statusLog[1].t or tick()
+        for _, e in ipairs(statusLog) do out[#out+1] = ('  [%6.1fs] %s'):format(e.t - t0, e.msg) end
+        local txt = table.concat(out, '\n')
+        local path = ('HSHub_cos_autolog_%d.txt'):format(os.time())
+        local ok = false
+        pcall(function() if writefile then writefile(path, txt); ok = true end end)
+        pcall(function() if setclipboard then setclipboard(txt) end end)
+        HSHub:Notify(ok and ('Log saved: ' .. path .. ' (+clipboard)') or 'Log copied to clipboard', 'ok', 4)
+    end
+    RG:AddButton({ Name = 'Export Log (this server)', Callback = exportLog })
+    RG:AddLabel('Hit Export when a bug happens, then send the file.', Color3.fromRGB(150, 150, 180))
+
+    -- stats refresh loop (1.5s, lightweight: read tables + set labels)
+    task.spawn(function()
+        while true do
+            task.wait(1.5)
+            pcall(function()
+                local hr = (huntIdx > 0 and REGION_COORDS[huntIdx]) and REGION_COORDS[huntIdx][1] or '-'
+                nowLbl:Set(('Now: %s  |  hunting %s'):format(tostring(lastActive or 'idle'), hr))
+                local have, empty = {}, {}
+                for _, rg in ipairs(REGION_COORDS) do
+                    local nm = rg[1]
+                    if regionBlacklist[nm] then empty[#empty + 1] = nm
+                    elseif (regionLog[nm] or 0) > 0 then have[#have + 1] = nm .. ':' .. tostring(regionLog[nm]) end
+                end
+                meatLbl:Set('Meat: ' .. (#have > 0 and table.concat(have, ', ') or '-'))
+                emptyLbl:Set(('Empty: %d/%d %s'):format(#empty, #REGION_COORDS,
+                    #empty > 0 and ('(' .. table.concat(empty, ', ') .. ')') or ''))
+                local cds = {}
+                for _, n in ipairs(orderedShrines()) do
+                    local e = completed[n]
+                    if e and tick() < e then cds[#cds + 1] = ('%s %dm'):format(n, math.ceil((e - tick()) / 60)) end
+                end
+                cdLbl:Set('Cooldowns: ' .. (#cds > 0 and table.concat(cds, ', ') or '-'))
+            end)
+        end
+    end)
 end
 
 -- ════════════════════════════════════════════════════════════════════
